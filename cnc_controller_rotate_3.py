@@ -365,6 +365,76 @@ class CNCController:
         time.sleep(1)
         print("Done!")
     
+    def repeat_test(self):
+        """
+        Repeat test: Move to X=156, Y=0, then alternate between Z=-15 and Z=-21 for 1000 cycles.
+        """
+        print("\n=== Starting Repeat Test ===")
+        
+        x = 156.0
+        y = 0.0
+        z_top = -15.0
+        z_bottom = -21.0
+        repetitions = 1000
+        
+        # Set absolute mode and feed rate
+        self.serial_port.write(b'G90\n')
+        time.sleep(0.1)
+        self.set_feed_rate(200)
+        
+        # Move to starting position (X=156, Y=0, Z=-15)
+        print(f"Moving to starting position: X={x}, Y={y}, Z={z_top}")
+        self.absolute_move(x, y, z_top)
+        
+        # Wait for initial move to complete
+        while True:
+            time.sleep(0.2)
+            self.serial_port.write(b'?')
+            response = self.serial_port.readline().decode('utf-8').strip()
+            if response.startswith("<Idle") or "Idle" in response:
+                break
+        
+        print(f"Starting {repetitions} cycles of Z movement...")
+        
+        # Alternate between z_top and z_bottom
+        for i in range(repetitions):
+            # Move down to z_bottom
+            self.absolute_move(x, y, z_bottom)
+            while True:
+                time.sleep(0.1)
+                self.serial_port.write(b'?')
+                response = self.serial_port.readline().decode('utf-8').strip()
+                if response.startswith("<Idle") or "Idle" in response:
+                    break
+            
+            # Move up to z_top
+            self.absolute_move(x, y, z_top)
+            while True:
+                time.sleep(0.1)
+                self.serial_port.write(b'?')
+                response = self.serial_port.readline().decode('utf-8').strip()
+                if response.startswith("<Idle") or "Idle" in response:
+                    break
+            
+            # Print progress every 50 cycles
+            if (i + 1) % 50 == 0:
+                print(f"Progress: {i + 1}/{repetitions} cycles completed")
+        
+        print("\n=== Repeat Test Complete ===")
+        print("Returning to home position...")
+        self.absolute_move(0, 0, 0)
+        
+        # Wait for return home to complete
+        while True:
+            time.sleep(0.2)
+            self.serial_port.write(b'?')
+            response = self.serial_port.readline().decode('utf-8').strip()
+            if response.startswith("<Idle") or "Idle" in response:
+                break
+        
+        time.sleep(1)
+        print("Done!")
+    
     def jog_mode(self, rotation_control=None):
             self.set_incremental_mode(); self.set_feed_rate(200)
             lin_steps = [0.1,0.5,1,2,5]; lin_i=2
@@ -551,7 +621,7 @@ def main():
   
 
     while True:
-        command = input("Enter command (s=status, mh=move to machine home, h=go to work home, sethome=set work home, gp=get mechanical home position, a=absolute move, r=relative move, j=jog mode, swp=sweep dome, q=quit): ").strip().lower()
+        command = input("Enter command (s=status, mh=move to machine home, h=go to work home, sethome=set work home, gp=get mechanical home position, a=absolute move, r=relative move, j=jog mode, swp=sweep dome, rpt=repeat test, q=quit): ").strip().lower()
         
         if command == 's':  # Query status
             controller.query_status()
@@ -576,6 +646,9 @@ def main():
         
         elif command == 'swp':  # Sweep dome pattern
             controller.sweep_dome()
+        
+        elif command == 'rpt':  # Repeat test
+            controller.repeat_test()
         
         elif command == 'a':  # Absolute move
             try:
