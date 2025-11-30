@@ -1,0 +1,15 @@
+--- 4D Test Configuration for 'star_fatstar' ---
+Timestamp: 20250701_043608
+
+seg_xy: 2
+seg_theta: 2
+seg_z: 2
+range_xy: 4.0
+range_theta: 90.0
+range_z: 2.0
+
+--- Scan Log ---
+Completed: Z=0.000, Theta=-45.000 | 25.0% | 2025-07-01 04:36:26
+Completed: Z=0.000, Theta=45.000 | 50.0% | 2025-07-01 04:36:45
+Completed: Z=2.000, Theta=-45.000 | 75.0% | 2025-07-01 04:37:10
+Completed: Z=2.000, Theta=45.000 | 100.0% | 2025-07-01 04:37:30

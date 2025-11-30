@@ -1,0 +1,620 @@
+#!/usr/bin/env python3
+
+import serial
+import time
+import re
+import os
+import glob
+import threading  # <-- NEW: For background monitoring
+from pynput import keyboard  # Using pynput as in your original
+import serial.tools.list_ports  # Import for listing serial ports
+
+
+class CNCController:
+    def __init__(self, baudrate=115200, timeout=1):
+        print("Initializing CNC Controller...")
+        self.HOME_FILE = "home_position_aticenter.txt"  # Your file name
+
+        # Get list of all available USB serial ports
+        available_ports = glob.glob("/dev/ttyUSB*")
+        
+        # --- This block is for Windows, uncomment if needed ---
+        # if not available_ports:
+        #     print("No /dev/ttyUSB* found, checking for COM ports (Windows)...")
+        #     available_ports = [port.device for port in serial.tools.list_ports.comports()]
+        # -----------------------------------------------------
+
+        if not available_ports:
+            raise Exception("No serial ports found!")
+
+        # Try connecting to each available port
+        self.serial_port = None
+        for port in available_ports:
+            try:
+                print(f"Trying {port}...")
+                # --- FIX 1: Set a shorter timeout for the serial port ---
+                self.serial_port = serial.Serial(port=port, baudrate=baudrate, timeout=0.1) # Changed from 1 to 0.1
+                print(f"Connected successfully to {port}")
+                break  # Exit the loop if successful
+            except serial.SerialException as e:
+                print(f"Failed to connect to {port}: {e}")
+
+        if self.serial_port is None:
+            raise Exception("Could not connect to any available serial port. Check connections and permissions.")
+
+        # --- New variables for threaded monitoring ---
+        self.position_lock = threading.Lock()  # To safely access position data
+        self.stop_event = threading.Event()    # To signal the thread to stop
+        self.monitoring_thread = None          # To hold the thread object
+
+        # These will be updated by the background thread
+        self.current_status = "Unknown"
+        self.current_mpos = (0.0, 0.0, 0.0)  # Machine Position
+        self.current_wpos = (0.0, 0.0, 0.0)  # Work Position
+
+        # The parameter you wanted! (in queries per second)
+        self.query_frequency_hz = 10.0  # Default to 10 Hz (100ms delay)
+        # --- End of new variables ---
+        
+        time.sleep(2) # Wait for GRBL to initialize
+        self.serial_port.flushInput() # Clear any startup text
+
+
+    def close(self):
+        """Cleanly stop monitoring and close the serial port."""
+        self.stop_monitoring()
+        if self.serial_port and self.serial_port.is_open:
+            self.serial_port.close()
+            print("Monitoring stopped and serial port closed.")
+
+    # --- New Methods for Threaded Monitoring ---
+
+    def set_query_frequency(self, freq_hz):
+        """Set the position query frequency (in Hz)."""
+        if freq_hz > 0:
+            self.query_frequency_hz = float(freq_hz)
+            print(f"Query frequency set to {freq_hz} Hz (interval: {1.0/freq_hz:.3f}s)")
+        else:
+            print("Error: Frequency must be positive.")
+
+    def _monitor_loop(self):
+        """The main loop for the background monitoring thread."""
+        print("Monitoring thread started.")
+        while not self.stop_event.is_set():
+            try:
+                # --- FIX 2: Remove the sleep_time calculation ---
+                # The self.serial_port.readline() with its 0.1s timeout IS the delay.
+                
+                # Send the status query
+                self.serial_port.write(b'?\n')
+                
+                # Read the response (this will block for max 0.1s)
+                response = self.serial_port.readline().decode('utf-8').strip()
+
+                if response:
+                    # Use regex to find status (e.g., <Idle|...)
+                    status_match = re.search(r"<(\w+)", response)
+                    mpos_match = re.search(r"MPos:([-\d.]+),([-\d.]+),([-\d.]+)", response)
+                    wpos_match = re.search(r"WPos:([-\d.]+),([-\d.]+),([-\d.]+)", response)
+
+                    # Use the lock to safely update shared variables
+                    with self.position_lock:
+                        if status_match:
+                            self.current_status = status_match.group(1)
+                        if mpos_match:
+                            self.current_mpos = (float(mpos_match.group(1)),
+                                                 float(mpos_match.group(2)),
+                                                 float(mpos_match.group(3)))
+                        if wpos_match:
+                            self.current_wpos = (float(wpos_match.group(1)),
+                                                 float(wpos_match.group(2)),
+                                                 float(wpos_match.group(3)))
+                
+                # --- FIX 2: REMOVED time.sleep(sleep_time) ---
+
+            except serial.SerialException as e:
+                print(f"Serial error in monitor thread: {e}")
+                self.stop_event.set()  # Stop the thread on serial error
+            except Exception as e:
+                print(f"General error in monitor thread: {e}")
+                # Don't stop on parsing errors, just log and continue
+                time.sleep(0.5) 
+
+        print("Monitoring thread stopped.")
+
+    def start_monitoring(self):
+        """Start the background monitoring thread."""
+        if self.monitoring_thread is None or not self.monitoring_thread.is_alive():
+            self.stop_event.clear()
+            # daemon=True means the thread will exit when the main program exits
+            self.monitoring_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+            self.monitoring_thread.start()
+        else:
+            print("Monitoring is already running.")
+
+    def stop_monitoring(self):
+        """Signal the background monitoring thread to stop."""
+        if self.monitoring_thread and self.monitoring_thread.is_alive():
+            self.stop_event.set()
+            self.monitoring_thread.join(timeout=1)  # Wait 1s for it
+            self.monitoring_thread = None
+
+    # --- New Non-Blocking "Getters" ---
+    
+    def get_current_status(self):
+        """Get the last known machine status (non-blocking)."""
+        with self.position_lock:
+            return self.current_status
+
+    def get_current_mpos(self):
+        """Get the last known machine position (non-blocking)."""
+        with self.position_lock:
+            return self.current_mpos
+
+    def get_current_wpos(self):
+        """Get the last known work position (non-blocking)."""
+        with self.position_lock:
+            return self.current_wpos
+
+    # --- End of New Monitoring Methods ---
+
+    def unlock_cnc(self):
+        """Unlock the CNC machine to allow manual control."""
+        self.serial_port.write(b'$X\n')
+        time.sleep(1)
+
+        command = f'$10=1\n'  # Format the GRBL command / shows Mpos
+        self.serial_port.write(b"$10=0\n")  # Disable override lock
+        time.sleep(0.1)
+        
+        self.serial_port.write(command.encode())  # Send the command
+        print('CNC machine unlocked')
+
+    def view_grbl_settings(self):
+        """View the current Grbl settings."""
+        self.serial_port.write(b'$$\n')  # Send the settings query command
+        time.sleep(0.5)  # Wait for the CNC machine to respond
+        response = self.serial_port.read(self.serial_port.in_waiting).decode('utf-8').strip()
+        print(f'Grbl settings:\n{response}')
+
+    def reset_grbl_settings(self):
+        """Reset Grbl settings to default values."""
+        self.serial_port.write(b'$RST=$\n')  # Send the reset command
+        time.sleep(0.5)  # Wait for the CNC machine to respond
+        response = self.serial_port.readline().decode('utf-8').strip()
+        if 'ok' in response:
+            print('Grbl settings reset to default')
+        else:
+            print('Failed to reset Grbl settings')
+
+    def move_to_machine_home(self):
+        """Perform homing operation on the CNC machine."""
+        print("Starting homing cycle ($H)...")
+        self.serial_port.write(b'$H\n')
+        print('Homing command sent. Monitoring progress...')
+        self._monitor_move_completion() # <-- ADDED
+    
+    def _monitor_move_completion(self):
+        """
+        (Internal) Prints a live position feed until the machine is 'Idle'.
+        This respects the query_frequency_hz.
+        """
+        print("--- Monitoring move (press Ctrl+C to stop monitoring) ---")
+        
+        # --- NEW: Wait for the move to START ---
+        # We must wait for the status to change from 'Idle' to 'Run' or 'Move'
+        # Give it a 1 second timeout to start
+        start_time = time.time()
+        while self.get_current_status() == 'Idle':
+            if time.time() - start_time > 1.0:
+                print("\n--- WARNING: Move never started (machine remained Idle). Check G-code or machine state. ---")
+                return # Exit if move doesn't start
+            time.sleep(0.05) # Poll quickly to catch the start
+        
+        print("--- Move detected (Status no longer 'Idle'). Monitoring completion... ---")
+
+        # --- OLD: Now we wait for the move to FINISH ---
+        try:
+            while True:
+                # Get the latest data from the background thread
+                status = self.get_current_status()
+                
+                # Check if machine is Idle
+                if status == 'Idle':
+                    time.sleep(0.1) # Wait one more cycle to be sure
+                    status = self.get_current_status() # Final check
+                    if status == 'Idle':
+                        break # Exit loop if truly Idle
+                
+                mpos = self.get_current_mpos()
+                wpos = self.get_current_wpos()
+                
+                # \r moves cursor to start of line. end='' prevents newline.
+                # The spaces at the end clear any leftover characters.
+                print(f"Status: <{status}> | MPos: {mpos} | WPos: {wpos}          ", end='\r')
+                
+                # --- FIX 3: Decouple print frequency from query frequency ---
+                # Use a fixed, small sleep to create a smooth 20Hz print rate.
+                time.sleep(0.05)
+
+        except KeyboardInterrupt:
+            print("\n--- User interrupted move monitoring ---")
+            print("--- Sending 'hold' command (!) ---")
+            self.serial_port.write(b'!') # Send a Feed Hold
+            pass
+        
+        # Clear the live-print line with a final newline
+        print("\n--- Move finished or monitoring stopped ---")
+       
+    def get_current_position_mechanical_home(self):
+        """
+        (Blocking) Continuously query until a valid MPos is obtained.
+        NOTE: This is the old blocking method. Use get_current_mpos() for non-blocking.
+        """
+        while True:
+            self.serial_port.write(b'?\n')
+            time.sleep(0.1)
+            response = self.serial_port.readline().decode('utf-8').strip()
+            match = re.search(r"MPos:([-\d.]+),([-\d.]+),([-\d.]+)", response)
+            if match:
+                x = float(match.group(1))
+                y = float(match.group(2))
+                z = float(match.group(3))
+                print(f"Current position (mechanical home): X={x}, Y={y}, Z={z}")
+                return x, y, z
+            else:
+                time.sleep(0.1)
+
+    def get_feed_rate(self):
+        """Get the current feed rate."""
+        print(f'Current feed rate: {self.feed_rate} mm/min')
+        return self.feed_rate
+    
+    def save_home_position(self, x, y, z):
+            """Save the current home position to a file."""
+            # Use the same logic as your load_home_position
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            file_path = os.path.join(script_dir, self.HOME_FILE)
+            with open(file_path, "w") as f:
+                f.write(f"{x},{y},{z}")
+            print(f"Home position saved to {file_path}: X={x}, Y={y}, Z={z}")
+
+    def load_home_position(self):
+        """Load the saved home position from a file and set it as the work home, if available."""
+        script_dir = os.path.dirname(os.path.abspath(__file__))  # Folder where the script is
+        file_path = os.path.join(script_dir, self.HOME_FILE)
+        print(f"Loading home from: {file_path}")
+        if os.path.exists(file_path):  # Check if file exists
+            try:
+                with open(file_path, "r") as f:
+                    data = f.read().strip()
+                    x, y, z = map(float, data.split(","))
+                    print(f"Loaded saved home position: X={x}, Y={y}, Z={z}")
+                    return x,y,z
+            except Exception as e:
+                print(f"Error loading home position: {e}")
+                print("Skipping home position load.")
+                return None
+        else:
+            print("No saved home position found. Skipping home setup.")
+            return None
+
+    def set_curPos_home(self):
+        """Set the current position as the work home (G92) and save its MPos."""
+        # Get the *current* machine position from the non-blocking getter
+        pos = self.get_current_mpos()
+        if pos:
+            x, y, z = pos
+            print(f"Current MPos is X={x}, Y={y}, Z={z}.")
+            self.serial_port.write(b'G92 X0 Y0 Z0\n')  # Set current position to be Work Home (0,0,0)
+            time.sleep(0.1)
+            self.save_home_position(x, y, z)  # Save the MPos coordinates
+            print("Current position set as work home (G92) and MPos saved.")
+            return x,y,z
+        else:
+            print("Error: Could not retrieve position to set home.")
+
+    def relative_move(self, x, y, z):
+        """Send a relative movement command to the CNC machine."""
+        self.serial_port.write(f'G91 G01 X{x} Y{y} Z{z} F{self.feed_rate}\n'.encode())
+        # print(f'Relative Move: G91 X{x} Y{y} Z{z}') # Commented out for less spam
+
+    def absolute_move(self, x, y, z):
+        """Send an absolute movement command to the CNC machine."""
+        # --- THE FIX: Removed '=' from Z{z} ---
+        self.serial_port.write(f'G90 G01 X{x} Y{y} Z{z} F{self.feed_rate}\n'.encode())
+        print(f'Absolute Move: G90 G01 X{x} Y{y} Z{z} F{self.feed_rate}')
+        self._monitor_move_completion() # <-- ADDED
+
+    def query_status(self):
+        """(Blocking) Query the current status of the CNC machine."""
+        self.serial_port.write(b'?')
+        cnc_curr_status = self.serial_port.readline().decode('utf-8')
+        print(f'CNC status: {cnc_curr_status}')
+        return cnc_curr_status
+
+    def set_feed_rate(self, feed_rate):
+        """Set the feed rate for CNC movement in mm/min."""
+        self.feed_rate = feed_rate
+        # This is a modal command, it applies to future G01/G02/G03 moves
+        self.serial_port.write(f"G90 F{feed_rate}\n".encode()) 
+        print(f"Feed rate set to: {feed_rate} mm/min")
+        time.sleep(0.1)
+
+    def set_incremental_mode(self):
+        """Set CNC to relative (incremental) positioning mode."""
+        self.serial_port.write(b'G91\n')
+        time.sleep(0.1)
+        print("Incremental mode set.")
+
+    def jog_mode(self):
+        """
+        Interactive jogging that works under an unprivileged user
+        (arrow keys = X/Y, [ ] = Z, ,/. step size, Esc quits).
+        """
+        self.set_incremental_mode()
+        if not hasattr(self, 'feed_rate'):
+            self.set_feed_rate(200) # Set a default if not set
+        vel = self.feed_rate
+
+        print("Jog mode ⟿  arrows: X/Y   [ ]: Z   , .: step   Esc: quit")
+
+        steps = [0.1, 0.5, 1, 2, 5, 10]
+        step_i = 2           # default 1 mm
+        print(f"Step → {steps[step_i]} mm")
+
+        def on_press(key):
+            nonlocal step_i
+            try:
+                k = key.char
+            except AttributeError:
+                k = None
+
+            # ── X / Y axes ────────────────────────────────────────────
+            if key == keyboard.Key.right:
+                self.relative_move( steps[step_i], 0, 0)
+            elif key == keyboard.Key.left:
+                self.relative_move(-steps[step_i], 0, 0)
+            elif key == keyboard.Key.up:
+                self.relative_move(0,  steps[step_i], 0)
+            elif key == keyboard.Key.down:
+                self.relative_move(0, -steps[step_i], 0)
+
+            # ── Z axis ───────────────────────────────────────────────
+            elif k == '[':
+                self.relative_move(0, 0, -steps[step_i])
+            elif k == ']':
+                self.relative_move(0, 0,  steps[step_i])
+
+            # ── step size control ───────────────────────────────────
+            elif k == ',':
+                step_i = max(0, step_i - 1)
+                print(f"Step → {steps[step_i]} mm")
+            elif k == '.':
+                step_i = min(len(steps) - 1, step_i + 1)
+                print(f"Step → {steps[step_i]} mm")
+
+            # ── quit ────────────────────────────────────────────────
+            elif key == keyboard.Key.esc or k in ('q', 'Q'):
+                print("Exiting jog mode.")
+                self.serial_port.write(b'G90\n') # Return to absolute mode
+                print("Absolute mode (G90) set.")
+                return False        # stop the listener
+
+        # Start listening (blocks until Esc / q pressed)
+        with keyboard.Listener(on_press=on_press) as listener:
+            listener.join()
+ 
+    def test_mode(self, l, segments, wait_t, z_offset):
+        """
+        Sweep a square centered at the current work-home origin.
+        Start at (-l/2, +l/2). After each move, update and print calculated (x,y,z) position.
+        """
+        print("--- Starting test_mode raster scan ---")
+        # 0. Switch controller to incremental mode
+        self.set_incremental_mode()
+        vel = 200  # Movement speed
+        self.set_feed_rate(vel)
+
+        # 1. Apply Z offset if needed
+        dz = float(z_offset)
+        z = 0.0  # initialize z
+        if abs(dz) > 1e-9:
+            self.relative_move(0, 0, dz)
+            time.sleep(wait_t)
+            z += dz
+
+        # 2. Pre-compute step size
+        step_xy = l / (segments - 1) if segments > 1 else 0.0
+
+        # 3. Move to starting point (-l/2, l/2)
+        x = 0.0
+        y = 0.0
+        self.relative_move(-l/2, l/2, 0)
+        time.sleep(wait_t)
+        x += -l/2
+        y += l/2
+        print(f"Current Position: X={x:.3f}, Y={y:.3f}, Z={z:.3f}")
+
+        # 4. Raster scan
+        for row in range(segments):
+            dir_sign = 1 if row % 2 == 0 else -1
+
+            for col in range(segments - 1):
+                dx = dir_sign * step_xy
+                self.relative_move(dx, 0, 0)
+                time.sleep(wait_t)
+                x += dx
+                print(f"Current Position: X={x:.3f}, Y={y:.3f}, Z={z:.3f}")
+
+            if row < segments - 1:
+                dy = -step_xy
+                self.relative_move(0, dy, 0)
+                time.sleep(wait_t)
+                y += dy
+                print(f"Current Position: X={x:.3f}, Y={y:.3f}, Z={z:.3f}")
+
+        # 5. Return to 0,0 (relative to where test started)
+        print("Returning to test start point...")
+        self.relative_move(-x, -y, 0)
+        time.sleep(wait_t)
+        # 6. Return to absolute mode
+        self.serial_port.write(b'G90\n')
+        print("Absolute mode (G90) set.")
+        print("--- Test-mode square complete. ---")
+
+
+def main():
+    try:
+        # Create an instance of the CNC Controller
+        controller = CNCController()
+    except Exception as e:
+        print(f"FATAL: Could not initialize controller: {e}")
+        return
+
+    # Unlock CNC and start monitoring
+    controller.unlock_cnc()
+    controller.set_query_frequency(10.0)  # Poll 10 times/sec
+    controller.start_monitoring()
+    
+    controller.set_feed_rate(500)
+    controller.move_to_machine_home()
+    
+    print("Waiting for homing to complete (watching status)...")
+    while True:
+        status = controller.get_current_status()
+        if status == "Idle":
+            print("\nHoming complete. Machine is Idle.")
+            break
+        # Print status while waiting
+        # REMOVED the print(f"Homing... Current Status: <{status}>", end='\r')
+        # because move_to_machine_home now handles monitoring.
+        time.sleep(0.2)
+  
+
+    while True:
+        # --- THIS IS THE KEY ---
+        # Get the latest status and position *before* asking for input
+        # This makes the prompt show the live position
+        c_status = controller.get_current_status()
+        c_mpos = controller.get_current_mpos()
+        c_wpos = controller.get_current_wpos()
+        
+        prompt = (f"\n[<{c_status}> MPos:{c_mpos} WPos:{c_wpos}]\n"
+                  f"Enter command (p=pos, s=status, mh=home, h=goto_work_home, sethome, a=abs, r=rel, j=jog, test, setfreq, q=quit): ")
+
+        try:
+            command = input(prompt).strip().lower()
+        except KeyboardInterrupt:
+            print("\nCaught Ctrl-C. Exiting.")
+            command = 'q'
+        
+        if not command:
+            continue
+            
+        if command == 'p':  # New command for explicit position
+            mpos = controller.get_current_mpos()
+            wpos = controller.get_current_wpos()
+            print(f"Current MPos: {mpos}")
+            print(f"Current WPos: {wpos}")
+            
+        # --- REMOVED 'livepos' COMMAND ---
+            
+        elif command == 's':  # Status (now just reads the variable)
+            print(f"Current Status: <{controller.get_current_status()}>")
+            
+        elif command == 'u':
+            controller.unlock_cnc()
+
+        elif command == 'mh':  # Move to machine home
+            controller.move_to_machine_home()
+        
+        elif command == 'h':  # Go to saved work home (using MPos)
+            pos = controller.load_home_position()
+            if pos:
+                x,y,z = pos
+                controller.set_feed_rate(1000)
+                print(f"Moving to saved MPos: {x}, {y}, {z}")
+                controller.absolute_move(x,y,z)  # This is an absolute MPos move
+                # REMOVED print("--- Machine moving... ---") as absolute_move now monitors.
+            else:
+                print("No home position loaded.")
+        
+        elif command == 'sethome':  # Set current MPos as work home
+            controller.set_curPos_home()
+        
+        elif command == 'gp':  # Get position (old blocking way)
+            print("Getting MPos (blocking)...")
+            controller.get_current_position_mechanical_home()
+            print("Use 'p' for non-blocking.")
+        
+        elif command == 'a':  # Absolute move (in current coordinate system, G90)
+            try:
+                coords = input("Enter target position (x,y,z): ").strip().split(',')
+                if len(coords) == 3:
+                    x = float(coords[0])
+                    y = float(coords[1])
+                    z = float(coords[2])
+                    controller.absolute_move(x, y, z)
+                    # REMOVED print("--- Machine moving... ---") as absolute_move now monitors.
+                else:
+                    print("Invalid input. Use x,y,z")
+            except ValueError:
+                print("Invalid input. Use numeric values.")
+        
+        elif command == 'r':  # Relative move (G91)
+            try:
+                dist = input("Enter distance to move (x,y,z): ").strip().split(',')
+                if len(dist) == 3:
+                    x = float(dist[0])
+                    y = float(dist[1])
+                    z = float(dist[2])
+                    controller.set_incremental_mode() # G91
+                    controller.relative_move(x, y, z)
+                    controller.serial_port.write(b'G90\n') # Return to G90
+                    print(f"--- Machine moving by ({x},{y},{z}). Monitoring... ---")
+                    controller._monitor_move_completion() # <-- ADDED
+                else:
+                    print("Invalid input. Use x,y,z")
+            except ValueError:
+                print("Invalid input. Use numeric values.")
+        
+        elif command == 'j':  # Jog mode
+            print("Starting jog mode...")
+            try:
+                controller.jog_mode()
+            except Exception as e:
+                print(f"Error in jog mode: {e}")
+            
+        elif command == "test":
+            # default:  l=4 mm, segments=10, wait=4 s, z=0 mm offset
+            controller.test_mode(4, 10, 4, 0)
+            print("--- Test move sent. Monitoring final move... ---")
+            controller._monitor_move_completion() # <-- ADDED
+        elif command.startswith("test "):
+            try:
+                _, argstr = command.split(" ", 1)
+                l, seg, wt, z = [a.strip() for a in argstr.split(",")]
+                controller.test_mode(float(l), int(seg), float(wt), z)
+                print("--- Custom test move sent. Monitoring final move... ---")
+                controller._monitor_move_completion() # <-- ADDED
+            except Exception:
+                print("Usage: test  l,segments,wait_time,z")
+                
+        elif command == 'setfreq':
+            try:
+                freq = float(input("Enter new query frequency in Hz (e.g., 5 or 20): "))
+                controller.set_query_frequency(freq)
+            except ValueError:
+                print("Invalid number.")
+                    
+        elif command == 'q':  # Quit
+            print("Exiting program.")
+            controller.close()
+            break
+        
+        else:
+            print("Invalid command. Try again.")
+
+if __name__ == '__main__':
+    main()

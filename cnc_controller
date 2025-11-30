@@ -1,0 +1,411 @@
+#!/usr/bin/env python3
+
+import serial
+import time
+import re
+import keyboard
+import os
+import serial.tools.list_ports  # Import for listing serial ports
+
+import glob
+
+class CNCController:
+    def __init__(self, baudrate=115200, timeout=1):
+        print("Initializing CNC Controller...")
+        self.HOME_FILE = "home_position.txt"  # File to store home position
+
+        # Get list of all available USB serial ports
+        available_ports = glob.glob("/dev/ttyUSB*")
+
+        if not available_ports:
+            raise Exception("No serial ports found!")
+
+        # Try connecting to each available port
+        for port in available_ports:
+            try:
+                print(f"Trying {port}...")
+                self.serial_port = serial.Serial(port=port, baudrate=baudrate, timeout=timeout)
+                print(f"Connected successfully to {port}")
+                break  # Exit the loop if successful
+            except serial.SerialException:
+                print(f"Failed to connect to {port}")
+
+        else:
+            # If no ports worked, raise an exception
+            raise Exception("Could not connect to any available serial port.")
+        # print("Initializing CNC Controller...")
+        # self.HOME_FILE = "home_position.txt"  # File to store home position
+
+        # # Get list of all available COM ports
+        # available_ports = [port.device for port in serial.tools.list_ports.comports()]
+
+        # if not available_ports:
+        #     raise Exception("No serial ports found! Ensure the CNC is connected and check Device Manager.")
+
+        # # Try connecting to each available port
+        # self.serial_port = None
+        # for port in available_ports:
+        #     try:
+        #         print(f"Trying {port}...")
+        #         self.serial_port = serial.Serial(port="COM7", baudrate=baudrate, timeout=timeout)
+        #         print(f"Connected successfully to {port}")
+        #         break  # Exit the loop if successful
+        #     except serial.SerialException as e:
+        #         print(f"Failed to connect to {port}: {e}")
+
+        # if self.serial_port is None:
+        #     raise Exception("Could not connect to any available serial port. Check connections and permissions.")
+
+    def unlock_cnc(self):
+        """Unlock the CNC machine to allow manual control."""
+        self.serial_port.write(b'$X\n')
+        time.sleep(1)
+
+        command = f'$10=1\n'  # Format the GRBL command / shows Mpos
+        self.serial_port.write(b"$10=0\n")  # Disable override lock
+        time.sleep(0.1)
+        
+        self.serial_port.write(command.encode())  # Send the command
+        print('CNC machine unlocked')
+
+    def view_grbl_settings(self):
+        """View the current Grbl settings."""
+        self.serial_port.write(b'$$\n')  # Send the settings query command
+        time.sleep(0.5)  # Wait for the CNC machine to respond
+        response = self.serial_port.read(self.serial_port.in_waiting).decode('utf-8').strip()
+        print(f'Grbl settings:\n{response}')
+
+    def reset_grbl_settings(self):
+        """Reset Grbl settings to default values."""
+        self.serial_port.write(b'$RST=$\n')  # Send the reset command
+        time.sleep(0.5)  # Wait for the CNC machine to respond
+        response = self.serial_port.readline().decode('utf-8').strip()
+        if 'ok' in response:
+            print('Grbl settings reset to default')
+        else:
+            print('Failed to reset Grbl settings')
+
+    def move_to_machine_home(self):
+        """Perform homing operation on the CNC machine."""
+        self.serial_port.write(b'$H\n')
+        time.sleep(2)
+        self.xcoord = 0.0
+        self.ycoord = 0.0
+        self.zcoord = 0.0
+        print('CNC machine homed')
+    
+    def get_current_position_work_home(self):
+        """
+        Continuously query the CNC machine for its current position relative to the work home (G92)
+        until a valid position (WPos) is obtained.
+
+        Returns:
+            tuple: A tuple containing the current X, Y, and Z coordinates relative to the work home.
+        """
+        while True:
+            # Send a status query to the CNC machine
+            self.serial_port.write(b'?\n')  # Ensure newline for GRBL
+            time.sleep(0.1)  # Wait for the response
+
+            # Read the response from the CNC machine
+            response = self.serial_port.readline().decode('utf-8').strip()
+            print(f"Raw CNC response: {response}")  # Debugging output
+
+            # Use regex to extract the current position from the response
+            match = re.search(r"WPos:([-\d.]+),([-\d.]+),([-\d.]+)", response)
+            if match:
+                x = float(match.group(1))  # Extract X coordinate
+                y = float(match.group(2))  # Extract Y coordinate
+                z = float(match.group(3))  # Extract Z coordinate
+                print(f"Current position (work home): X={x}, Y={y}, Z={z}")
+                return x, y, z  # Exit loop when a valid position is found
+            else:
+                print("Warning: Unable to parse current position. Retrying...")
+                time.sleep(0.1)  # Small delay before retrying
+       
+    def get_current_position_mechanical_home(self):
+        """
+        Continuously query the CNC machine for its current position relative to the mechanical home (machine coordinates)
+        until a valid position (MPos) is obtained.
+
+        Returns:
+            tuple: A tuple containing the current X, Y, and Z coordinates relative to the mechanical home.
+        """
+        while True:
+            # Send a status query to the CNC machine
+            self.serial_port.write(b'?\n')  # Ensure newline for GRBL
+            time.sleep(0.1)  # Wait for the response
+
+            # Read the response from the CNC machine
+            response = self.serial_port.readline().decode('utf-8').strip()
+            print(f"Raw CNC response: {response}")  # Debugging output
+
+            # Use regex to extract the current position from the response
+            match = re.search(r"MPos:([-\d.]+),([-\d.]+),([-\d.]+)", response)
+            if match:
+                x = float(match.group(1))  # Extract X coordinate
+                y = float(match.group(2))  # Extract Y coordinate
+                z = float(match.group(3))  # Extract Z coordinate
+                print(f"Current position (mechanical home): X={x}, Y={y}, Z={z}")
+                return x, y, z  # Exit loop when a valid position is found
+            else:
+                print("Warning: Unable to parse current position. Retrying...")
+                time.sleep(0.1)  # Small delay before retrying
+
+
+    def get_feed_rate(self):
+        """Get the current feed rate."""
+        print(f'Current feed rate: {self.feed_rate} mm/min')
+        return self.feed_rate
+    
+    def save_home_position(self, x, y, z):
+            """Save the current home position to a file."""
+            with open(self.HOME_FILE, "w") as f:
+                f.write(f"{x},{y},{z}")
+            print(f"Home position saved: X={x}, Y={y}, Z={z}")
+
+    def load_home_position(self):
+        """Load the saved home position from a file and set it as the work home, if available."""
+        if os.path.exists(self.HOME_FILE):  # Check if file exists
+            try:
+                with open(self.HOME_FILE, "r") as f:
+                    data = f.read().strip()
+                    x, y, z = map(float, data.split(","))
+                    # self.serial_port.write(f'G92 X{x} Y{y} Z{z}\n'.encode())
+                    print(f"Loaded and set saved home position: X={x}, Y={y}, Z={z}")
+                    return x,y,z
+            except Exception as e:
+                print(f"Error loading home position: {e}")
+                print("Skipping home position load.")
+        else:
+            print("No saved home position found. Skipping home setup.")
+
+    def set_curPos_home(self):
+        """Set the current position as the work home and save it."""
+        pos = self.get_current_position_mechanical_home()
+        if pos:
+            x, y, z = pos
+            self.serial_port.write(b'G92 X0 Y0 Z0\n')
+            time.sleep(0.1)
+            # self.save_home_position(x, y, z)  # Save home position
+            return x,y,z
+        else:
+            print("Error: Could not retrieve position to set home.")
+    def relative_move(self, x, y, z):
+        """Send a relative movement command to the CNC machine."""
+        self.serial_port.write(f'G91 X{x} Y{y} Z{z}\n'.encode())
+        time.sleep(0.1)
+        print(f'Relative Move: G91 X{x} Y{y} Z{z}')
+        # self.xcoord += x
+        # self.ycoord += y
+        # self.zcoord += z
+        # print(f'Current coordinates: X={self.xcoord}, Y={self.ycoord}, Z={self.zcoord}')
+
+    def absolute_move(self, x, y, z):
+        """Send an absolute movement command to the CNC machine."""
+        self.serial_port.write(f'G90 G01 X{x} Y{y} Z{z} F{self.feed_rate}\n'.encode())
+        time.sleep(0.1)
+        print(f'Absolute Move: G90 X{x} Y{y} Z{z} F{self.feed_rate}')
+
+    def query_status(self):
+        """Query the current status of the CNC machine."""
+        self.serial_port.write(b'?')
+        cnc_curr_status = self.serial_port.readline().decode('utf-8')
+        print(f'CNC status: {cnc_curr_status}')
+        return cnc_curr_status
+
+    # def set_feed_rate(self, feed_rate):
+    #     """Set the feed rate for CNC movement."""
+    #     self.feed_rate = feed_rate
+    #     self.serial_port.write(f'G21 F{feed_rate}\n'.encode())  # Set feed rate in mm/min
+    #     print(f'Feed rate set to: {feed_rate} mm/min')
+    #     time.sleep(0.1)
+
+    def set_feed_rate(self, feed_rate):
+        """Set the feed rate for CNC movement in mm/min."""
+        self.feed_rate = feed_rate
+        # self.serial_port.write("G21\n".encode())  # Ensure millimeter mode is set
+        time.sleep(0.1)  # Short delay for CNC to process
+        
+        self.serial_port.write(f"F{feed_rate}\n".encode())  # Set the feed rate
+        print(f"Feed rate set to: {feed_rate} mm/min")
+        time.sleep(0.1)  # Short delay
+
+
+
+    def set_incremental_mode(self):
+        """Set CNC to relative (incremental) positioning mode."""
+        self.serial_port.write(b'G91\n')
+        time.sleep(0.1)
+        print("Incremental mode set.")
+
+    def get_feed_rate(self):
+        """Get the current feed rate."""
+        print(f'Current feed rate: {self.feed_rate} mm/min')  # Print the current feed rate
+        return self.feed_rate  # Return the feed rate value
+
+    def jog_mode(self):
+        """Control CNC using Jogging. Press ESC to quit."""
+        self.set_incremental_mode()  # Set CNC to relative positioning mode
+        vel = 200  # Initial velocity in mm/min
+        self.set_feed_rate(vel)  # Apply initial feed rate
+    
+        print("Entering jog mode. Use arrow keys for X/Y, [ ] for Z, , . for speed control. Press ESC to exit.")
+        
+        steps = [0.1, 0.5, 1, 2, 5]  # Define step sizes
+        step_index = 2  # Start with step size 1
+        step = steps[step_index]
+    
+        while True:
+            # X-axis jogging
+            if keyboard.is_pressed('right'):
+                self.relative_move(step, 0, 0)  # Move right along X-axis
+                time.sleep(0.2)  # Debounce delay
+            elif keyboard.is_pressed('left'):
+                self.relative_move(-step, 0, 0)  # Move left along X-axis
+                time.sleep(0.2)  # Debounce delay
+    
+            # Y-axis jogging
+            if keyboard.is_pressed('up'):
+                self.relative_move(0, step, 0)  # Move forward along Y-axis
+                time.sleep(0.2)  # Debounce delay
+            elif keyboard.is_pressed('down'):
+                self.relative_move(0, -step, 0)  # Move backward along Y-axis
+                time.sleep(0.2)  # Debounce delay
+    
+            # Z-axis jogging
+            if keyboard.is_pressed('['):
+                self.relative_move(0, 0, -step)  # Move downward along Z-axis
+                time.sleep(0.2)  # Debounce delay
+            elif keyboard.is_pressed(']'):
+                self.relative_move(0, 0, step)  # Move upward along Z-axis
+                time.sleep(0.2)  # Debounce delay
+    
+            # Step control
+            if keyboard.is_pressed(','):
+                step_index = max(0, step_index - 1)  # Decrease step index, ensuring it doesn't go below 0
+                step = steps[step_index]
+                print(f"Current step: {step} mm")
+                time.sleep(0.2)  # Debounce delay
+            elif keyboard.is_pressed('.'):
+                step_index = min(len(steps) - 1, step_index + 1)  # Increase step index, ensuring it doesn't exceed max
+                step = steps[step_index]
+                print(f"Current step: {step} mm")
+                time.sleep(0.2)  # Debounce delay
+    
+            # Exit the loop on pressing 'esc'
+            if keyboard.is_pressed('esc'):
+                print("Exiting jog mode.")
+                break  # Break out of the while loop
+    
+            time.sleep(0.05)  # Small delay to reduce CPU usage and prevent overloading input handling
+
+
+def main():
+    # Create an instance of the CNC Controller
+    controller = CNCController()
+
+    # Unlock CNC and perform homing
+    controller.unlock_cnc()
+    controller.set_feed_rate(500)
+    controller.move_to_machine_home()
+    
+    
+    while True:
+        status = controller.query_status()  # Query the CNC machine's status
+        # Check if the status starts with "<Idle"
+        if status.startswith("<Idle"):
+            break  # Exit the loop once the machine is idle
+        time.sleep(0.1)  # Small delay to avoid spamming the CNC machine
+  
+
+    while True:
+        command = input("Enter command (s=status, mh=move to machine home, h=go to work home, sethome=set work home, gmp=get mechanical home position, a=absolute move, r=relative move, j=jog mode, q=quit): ").strip().lower()
+        
+        if command == 's':  # Query status
+            controller.query_status()
+        elif command == 'u':  # Move to machine home
+            controller.unlock_cnc()
+
+        elif command == 'mh':  # Move to machine home
+            controller.move_to_machine_home()
+        
+        elif command == 'h':  # Go to work home (absolute move to 0,0,0)
+            x,y,z = controller.load_home_position()
+            controller.set_feed_rate(1000)
+            controller.absolute_move(x,y,z)
+        
+        elif command == 'sethome':  # Alias for SH (set work home)
+            x,y,z=controller.get_current_position_mechanical_home()
+            controller.save_home_position(x,y,z)
+            controller.set_curPos_home()
+        
+        elif command == 'gp':  # Get current position relative to mechanical home
+            controller.get_current_position_mechanical_home()
+        
+        elif command == 'a':  # Absolute move
+            try:
+                # Prompt the user for X, Y, Z coordinates
+                coordinates = input("Enter the target position (x,y,z): ").strip().split(',')
+                if len(coordinates) == 3:
+                    x = float(coordinates[0])
+                    y = float(coordinates[1])
+                    z = float(coordinates[2])
+                    controller.absolute_move(x, y, z)
+                else:
+                    print("Invalid input. Please enter coordinates in the format x,y,z.")
+            except ValueError:
+                print("Invalid input. Please enter numeric values for x, y, and z.")
+        
+        elif command == 'r':  # Relative move
+            try:
+                # Prompt the user for X, Y, Z distances
+                distances = input("Enter the distance to move (x,y,z): ").strip().split(',')
+                if len(distances) == 3:
+                    x = float(distances[0])
+                    y = float(distances[1])
+                    z = float(distances[2])
+                    controller.relative_move(x, y, z)
+                else:
+                    print("Invalid input. Please enter distances in the format x,y,z.")
+            except ValueError:
+                print("Invalid input. Please enter numeric values for x, y, and z.")
+        
+        elif command == 'j':  # Jog mode
+            controller.jog_mode()
+            
+        elif command == 'test':  # Jog mode
+            
+            # x direction move
+            # controller.set_feed_rate(50)
+            # controller.relative_move(-2,0,0)
+            # controller.relative_move(4,0,0)
+            # controller.relative_move(-2,0,0)
+            
+            # x direction move
+            controller.set_feed_rate(50)
+            controller.relative_move(0,-2,0)
+            controller.relative_move(0,4,0)
+            controller.relative_move(0,-2,0)
+                    
+        elif command == 'q':  # Quit
+            print("Exiting program.")
+            break
+        #     # Speed control
+        # elif command == '+':
+        #     vel = controller.get_feed_rate()
+        #     vel = max(vel + 100, 1000)  # Decrease speed (minimum 20 mm/min)
+        #     print(f"Current velocity: {vel} mm/min")
+        #     time.sleep(0.2)  # Debounce delay
+        # elif command == '-':
+        #     vel = controller.get_feed_rate()
+        #     vel = min(vel - 100, 200)  # Increase speed (maximum 200 mm/min)
+        #     print(f"Current velocity: {vel} mm/min")
+        #     time.sleep(0.2)  # Debounce delay
+        
+        else:
+            print("Invalid command. Try again.")
+
+
+if __name__ == '__main__':
+    main()
