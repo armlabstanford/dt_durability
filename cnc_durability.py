@@ -355,12 +355,26 @@ class CNCController:
 
     def wait_for_idle(self):
         """Wait for CNC to finish current movement"""
+        # Small delay to allow CNC to start processing the command
+        time.sleep(0.05)
+        
+        # Clear any old responses in the buffer
+        self.serial_port.reset_input_buffer()
+        
+        # Now poll until idle
         while True:
-            time.sleep(0.1)
             self.serial_port.write(b'?')
+            time.sleep(0.05)  # Give time for response
             response = self.serial_port.readline().decode('utf-8').strip()
-            if response.startswith("<Idle") or "Idle" in response:
-                break
+            
+            if response:  # Only process if we got a response
+                # Print status for debugging
+                # print(f"[STATUS] {response}")
+                
+                if response.startswith("<Idle") or "Idle" in response:
+                    break
+            
+            time.sleep(0.1)  # Wait before next poll
 
     def unlock_cnc(self):
         """Unlock the CNC machine to allow manual control."""
@@ -573,33 +587,40 @@ class CNCController:
     
     def repeat_test(self, durability_tester=None):
         """
-        Repeat test: Move to X=156, Y=0, then alternate between Z=-15 and Z=-21 for 1000 cycles.
-        Now waits for each movement to complete before sending the next command.
+        Repeat test: Move to X=147, Y=0, then alternate between Z=-18 and Z=-24 for 1000 cycles.
+        Sends commands one at a time and waits for each to complete.
         """
         print("\n=== Starting Repeat Test ===")
         
-        x = 156.0
+        x = 147.0
         y = 0.0
-        z_top = -15.0
-        z_bottom = -21.0
+        z_top = -18.0
+        z_bottom = -24.0
         repetitions = 1000
         
-        # Set absolute mode and feed rate
+        # Set absolute mode
         self.serial_port.write(b'G90\n')
-        time.sleep(0.1)
-        self.set_feed_rate(200)
+        time.sleep(0.2)
+        self.serial_port.reset_input_buffer()  # Clear buffer
         
-        # Move to starting position (X=156, Y=0, Z=-15)
+        # Move to starting position with fast speed
         print(f"Moving to starting position: X={x}, Y={y}, Z={z_top}")
-        self.absolute_move(x, y, z_top)
+        cmd = f'G90 G01 X{x} Y{y} Z{z_top} F1500\n'
+        print(f"[CMD] {cmd.strip()}")
+        self.serial_port.write(cmd.encode())
+        self.serial_port.flush()  # Ensure command is sent
         self.wait_for_idle()
+        print("Arrived at starting position")
         
-        print(f"Starting {repetitions} cycles of Z movement...")
+        print(f"\nStarting {repetitions} cycles of Z movement...")
         
         # Alternate between z_top and z_bottom
         for i in range(repetitions):
             # Move down to z_bottom
-            self.absolute_move(x, y, z_bottom)
+            cmd = f'G90 G01 X{x} Y{y} Z{z_bottom} F1500\n'
+            print(f"[CMD {i+1}] DOWN: {cmd.strip()}")
+            self.serial_port.write(cmd.encode())
+            self.serial_port.flush()  # Ensure command is sent
             self.wait_for_idle()
             
             # Save data if durability tester is active
@@ -607,16 +628,22 @@ class CNCController:
                 durability_tester.save_data_point()
             
             # Move up to z_top
-            self.absolute_move(x, y, z_top)
+            cmd = f'G90 G01 X{x} Y{y} Z{z_top} F1500\n'
+            print(f"[CMD {i+1}] UP: {cmd.strip()}")
+            self.serial_port.write(cmd.encode())
+            self.serial_port.flush()  # Ensure command is sent
             self.wait_for_idle()
             
             # Print progress every 50 cycles
             if (i + 1) % 50 == 0:
-                print(f"Progress: {i + 1}/{repetitions} cycles completed")
+                print(f"\n===== Progress: {i + 1}/{repetitions} cycles completed =====\n")
         
         print("\n=== Repeat Test Complete ===")
         print("Returning to home position...")
-        self.absolute_move(0, 0, 0)
+        cmd = f'G90 G01 X0 Y0 Z0 F1500\n'
+        print(f"[CMD] {cmd.strip()}")
+        self.serial_port.write(cmd.encode())
+        self.serial_port.flush()  # Ensure command is sent
         self.wait_for_idle()
         time.sleep(1)
         print("Done!")
