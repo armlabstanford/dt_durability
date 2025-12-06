@@ -21,7 +21,7 @@ import NetFT
 # CONFIGURATION
 ##############################################################################
 # Camera Settings
-CAMERA_DEVICE_ID = 1       # /dev/video4 (Change according to your environment)
+CAMERA_DEVICE_ID = 6       # /dev/video4 (Change according to your environment)
 EXPOSURE_VALUE = 30        # Manual Exposure Value/s
 WB_TEMP = 6500             # White Balance Temperature
 FRAME_WIDTH = 1600
@@ -32,7 +32,7 @@ SENSOR_IP = "192.168.2.1"  # ATI Sensor IP
 COUNTS_PER_FORCE = 1000000.0
 COUNTS_PER_TORQUE = 1000000.0
 
-TOTAL_TOUCHES = 2
+TOTAL_TOUCHES = 5
 FZ_MAX_THRESHOLD = -3.7
 FZ_MIN_THRESHOLD = -0.001
 Z_STEP = 0.1
@@ -228,7 +228,11 @@ class DurabilityTester:
         if not self.active:
             print("[Warning] Durability tester not initialized. Use 'dt_start' first.")
             return
-            
+
+        # Flush camera buffer to get the most recent frame
+        for _ in range(5):
+            self.cap.read()
+
         ret, frame = self.cap.read()
         if not ret:
             print("[Error] Could not capture image.")

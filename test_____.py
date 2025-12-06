@@ -16,7 +16,7 @@ import NetFT
 # ==============================================================================
 # CONFIGURATION
 # ==============================================================================
-CAMERA_DEVICE_ID = 1       # /dev/video4 (Change according to your environment)
+CAMERA_DEVICE_ID = 6       # /dev/video4 (Change according to your environment)
 SENSOR_IP = "192.168.2.1"  # ATI Sensor IP
 
 # ATI Sensor Scaling Factors (Must check values from ATI web interface)
