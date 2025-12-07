@@ -32,11 +32,11 @@ SENSOR_IP = "192.168.2.1"  # ATI Sensor IP
 COUNTS_PER_FORCE = 1000000.0
 COUNTS_PER_TORQUE = 1000000.0
 
-TOTAL_TOUCHES = 5
+TOTAL_TOUCHES = 120
 FZ_MAX_THRESHOLD = -3.7
 FZ_MIN_THRESHOLD = -0.001
-Z_STEP = 0.1
-Z_SLEEP_TIME = 0.01
+Z_STEP = 0.2
+Z_SLEEP_TIME = 0.0025  # Halved from 0.01 to double the speed
 
 # NAS_MOUNT_PATH = '/mnt/armlabnas'
 NAS_MOUNT_PATH = '~'
@@ -90,14 +90,7 @@ class DurabilityTester:
         self.init_csv()
         
         # Capture Initial Image
-        ret, frame = self.cap.read()
-        if ret:
-            self.initial_image = frame.copy()
-            cv2.imwrite(os.path.join(self.trial_dir, "initial_image.png"), self.initial_image)
-            print("[Info] Initial reference image captured.")
-        else:
-            print("[Error] Could not capture initial image.")
-            return False
+        self.capture_initial_image()
             
         self.active = True
         print("[Durability Test] Ready!\n")
@@ -184,6 +177,25 @@ class DurabilityTester:
         for cmd in commands:
             os.system(cmd)
 
+    def capture_initial_image(self):
+        """Capture and save initial reference image with timestamp"""
+        # Flush camera buffer
+        for _ in range(5):
+            self.cap.read()
+
+        ret, frame = self.cap.read()
+        if ret:
+            self.initial_image = frame.copy()
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            img_filename = f"{timestamp}_initial_image.png"
+            img_path = os.path.join(self.trial_dir, img_filename)
+            cv2.imwrite(img_path, self.initial_image)
+            print(f"[Info] Initial reference image captured: {img_filename}")
+        else:
+            print("[Error] Could not capture initial image.")
+            return False
+        return True
+
     def compute_metrics(self, img1, img2):
         """Compute MSE, PSNR, SSIM, L1 between two images"""
         g1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
@@ -223,8 +235,13 @@ class DurabilityTester:
             return [fx, fy, fz, tx, ty, tz]
         return [0.0]*6
 
-    def save_data_point(self):
-        """Save current image and force data with metrics"""
+    def save_data_point(self, touch_number=None, state=None):
+        """Save current image and force data with metrics
+
+        Args:
+            touch_number: Current touch number (optional)
+            state: 'pressed' or 'unpressed' (optional)
+        """
         if not self.active:
             print("[Warning] Durability tester not initialized. Use 'dt_start' first.")
             return
@@ -237,17 +254,20 @@ class DurabilityTester:
         if not ret:
             print("[Error] Could not capture image.")
             return
-            
+
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        
+
         # Compute Metrics against initial image
         mse, psnr, ssim_val, l1 = self.compute_metrics(frame, self.initial_image)
-        
+
         # Get force reading
         ft = self.get_force_reading()
-        
-        # Save Image
-        img_filename = f"image_{timestamp}.png"
+
+        # Save Image (timestamp first for proper ordering)
+        if touch_number is not None and state is not None:
+            img_filename = f"{timestamp}_touch_{touch_number}_{state}_image.png"
+        else:
+            img_filename = f"{timestamp}_image.png"
         img_path = os.path.join(self.trial_dir, img_filename)
         cv2.imwrite(img_path, frame)
         
@@ -281,26 +301,37 @@ class DurabilityTester:
         zero_force = self.get_force_reading()
         print(zero_force)
         time.sleep(2.0)
+
         for i in range(TOTAL_TOUCHES):
-            print("Moving down")
+            # Recalibrate sensor every 100 touches (if TOTAL_TOUCHES > 100)
+            if i > 0 and i % 100 == 0 and TOTAL_TOUCHES > 100:
+                print(f"\n[Recalibration] Touch {i} reached. Recalibrating sensor...")
+                self.tare_sensor()
+                print("[Recalibration] Waiting 10 seconds for stabilization...")
+                time.sleep(10.0)
+                print("[Recalibration] Capturing new initial reference image...")
+                self.capture_initial_image()
+                print(f"[Recalibration] Complete. Resuming test...\n")
+
+            print(f"Touch {i+1}/{TOTAL_TOUCHES}: Moving down")
             num_down_steps = 0
             while self.get_force_reading()[2] > FZ_MAX_THRESHOLD:
                 cnc_controller.relative_move(0,0,-Z_STEP)
                 time.sleep(Z_SLEEP_TIME)
                 num_down_steps+=1
             # take photo and save PRESSED
-            self.save_data_point()
-            time.sleep(2.0)
+            self.save_data_point(touch_number=i+1, state='pressed')
+            time.sleep(1.5)
 
             print(f"Moving up: {num_down_steps*Z_STEP}")
             cnc_controller.relative_move(0,0, num_down_steps*Z_STEP)
-            time.sleep(2.0)
+            time.sleep(1.5)
             # while self.get_force_reading()[2] < FZ_MIN_THRESHOLD:
             #     cnc_controller.relative_move(0,0,Z_STEP)
             #     time.sleep(Z_SLEEP_TIME)
             # take photo and save UNPRESSED
-            self.save_data_point()
-        
+            self.save_data_point(touch_number=i+1, state='unpressed')
+
         print("Ending Test")
         # cnc_controller.relative_move(0,0, 20)
 
